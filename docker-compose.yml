@@ -1,0 +1,241 @@
+# =============================================================================
+# 中间件全家桶（Docker Compose）
+# 说明：Spring Boot 应用不在容器里，直接在宿主机 9900 端口启动；
+#       容器通过 host.docker.internal 访问宿主机应用。
+#
+# 启动（在项目根目录下执行）：
+#   docker compose up -d              # 启动全部中间件
+#   docker compose ps                 # 查看状态
+#   docker compose logs -f milvus     # 查看某个服务日志
+#   docker compose down               # 停止并删除容器（不动数据）
+#
+# 访问地址：
+#   Milvus          localhost:19530           （Spring Boot / RAG 向量库连接地址）
+#   Attu            http://localhost:8000     （Milvus 可视化管理界面）
+#   MinIO 控制台    http://localhost:9001     （账号 minioadmin / minioadmin）
+#   Redis           localhost:6379
+#   Prometheus      http://localhost:9090     （指标与告警规则）
+#   Alertmanager    http://localhost:9093     （告警路由，转发给 Spring Boot）
+#   node-exporter   http://localhost:9100     （系统基础指标，给 Prometheus 抓）
+#
+# 数据安全：Milvus 全家桶使用绑定挂载 ./volumes/...（已有向量数据），
+#           不要改动挂载路径，也不要执行 docker compose down -v。
+# =============================================================================
+
+name: oncall-agent
+
+services:
+  # ---------------------------------------------------------------------------
+  # etcd：Milvus 的元数据存储（记录有哪些集合、分区、索引等），相当于 Milvus 的“账本”
+  # ---------------------------------------------------------------------------
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.18
+    restart: unless-stopped
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      # 绑定挂载：元数据落在项目目录里，容器删除后数据仍在
+      - ./volumes/etcd:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # MinIO：Milvus 的对象存储（存放向量数据、索引文件、日志快照），相当于 Milvus 的“硬盘”
+  # 9000 是 S3 API 端口（Milvus 用），9001 是网页控制台端口（人用）
+  # ---------------------------------------------------------------------------
+  minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    restart: unless-stopped
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9001:9001"   # MinIO 控制台：http://localhost:9001
+      - "9000:9000"   # MinIO S3 API
+    volumes:
+      # 绑定挂载：几 GB 的向量数据实际就存在这里
+      - ./volumes/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Milvus standalone：向量数据库本体，RAG 知识问答的检索底座
+  # 服务名用 milvus（容器名仍是 milvus-standalone），这样 Attu 可以用 milvus:19530 解析
+  # 19530 是 SDK 端口（Spring Boot 连这个），9091 是健康检查/指标端口
+  # ---------------------------------------------------------------------------
+  milvus:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.5.10
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      # 绑定挂载：Milvus 自身的运行数据
+      - ./volumes/milvus:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "19530:19530"  # Milvus SDK 端口（application.yml 里 milvus.port: 19530）
+      - "9091:9091"    # Milvus 健康检查 / 指标端口
+    depends_on:
+      # 等 etcd 与 minio 都“健康”后再启动，避免 Milvus 起来后连不上后端
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Attu：Milvus 的网页版可视化管理工具（看集合、查数据、建索引）
+  # 容器内端口 3000 → 宿主机 8000（宿主机 3000 已被其他服务占用）
+  # ---------------------------------------------------------------------------
+  attu:
+    container_name: milvus-attu
+    image: zilliz/attu:v2.5
+    restart: unless-stopped
+    ports:
+      - "8000:3000"    # 浏览器访问 http://localhost:8000
+    environment:
+      # MILVUS_URL 指向同一网络里的 Milvus 服务名（compose 服务名即 DNS 名）
+      MILVUS_URL: milvus:19530
+    depends_on:
+      milvus:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Redis：缓存 / 会话 / 异步任务队列（AIOps 诊断过程的中间状态可放这里）
+  # 开启 AOF 持久化，数据落在命名卷 redis-data（由 Docker 管理，不占项目目录）
+  # ---------------------------------------------------------------------------
+  redis:
+    container_name: oncall-redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]  # 开启 AOF：每条写命令都落盘，重启不丢数据
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Prometheus：时序数据库 + 告警规则计算引擎
+  # 作用：每 15 秒去各个 exporter 抓一次指标（CPU/内存/磁盘…），
+  #       再按 rules.yml 里的规则判断“是否该报警”，触发后把告警推给 Alertmanager。
+  # ---------------------------------------------------------------------------
+  prometheus:
+    container_name: oncall-prometheus
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    ports:
+      - "9090:9090"    # Web UI：http://localhost:9090
+    volumes:
+      # 主配置（抓取目标 + 告警规则文件位置），只读挂载，改完重启容器即生效
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # 告警规则文件（5 条规则），只读挂载
+      - ./docker/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      # 命名卷：Prometheus 自己的时序数据（镜像默认数据目录就是 /prometheus）
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-lifecycle        # 允许 POST /-/reload 热加载配置，不用重启容器
+    depends_on:
+      - node-exporter
+      - alertmanager
+
+  # ---------------------------------------------------------------------------
+  # Alertmanager：告警路由器（去重、分组、静默、抑制，然后发通知）
+  # 本项目把告警 POST 回宿主机上的 Spring Boot（9900），由 AI Agent 自动诊断
+  # ---------------------------------------------------------------------------
+  alertmanager:
+    container_name: oncall-alertmanager
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    ports:
+      - "9093:9093"    # Web UI：http://localhost:9093
+    volumes:
+      - ./docker/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager   # 静默/通知去重状态，重启后不丢
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    extra_hosts:
+      # 让容器里能用 host.docker.internal 访问宿主机（Docker Desktop 自带；
+      # 在 Linux 上必须加这一行，host-gateway 会解析成宿主机的真实 IP）
+      - "host.docker.internal:host-gateway"
+
+  # ---------------------------------------------------------------------------
+  # 飞书适配器：把 Alertmanager 的 webhook 报文转成飞书机器人认识的 post 富文本
+  # 飞书机器人只收 msg_type/content 格式，让 Alertmanager 直接发过去会被拒
+  # ---------------------------------------------------------------------------
+  feishu-adapter:
+    container_name: oncall-feishu-adapter
+    build: ./docker/feishu-adapter
+    image: oncall-feishu-adapter:local
+    restart: unless-stopped
+    ports:
+      - "8080:8080"    # 浏览器打开 http://localhost:8080 可看是否已配置
+    environment:
+      # 飞书群机器人的 Webhook 地址，例如 https://open.feishu.cn/open-apis/bot/v2/hook/xxxx
+      # 真实值放项目根目录的 .env（已 gitignore）或直接设环境变量；留空则适配器只打印不发送
+      FEISHU_WEBHOOK_URL: "${FEISHU_WEBHOOK_URL:-}"
+      # 机器人开了"签名校验"才需要填
+      FEISHU_SECRET: "${FEISHU_SECRET:-}"
+
+  # ---------------------------------------------------------------------------
+  # node-exporter：把宿主机的 CPU / 内存 / 磁盘 / 网络等系统指标
+  # 暴露成 Prometheus 能读的格式（/metrics），本身不存数据
+  # ---------------------------------------------------------------------------
+  node-exporter:
+    container_name: oncall-node-exporter
+    image: prom/node-exporter:v1.8.2
+    restart: unless-stopped
+    ports:
+      - "9100:9100"    # 浏览器打开 http://localhost:9100/metrics 可看到原始指标
+    volumes:
+      # 只读挂载宿主机的 /proc、/sys、根文件系统，node-exporter 才能读到真实系统数据
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+
+# 所有中间件放在同一个自定义网络里，可以用「服务名」互相访问
+# （例如 prometheus 抓 node-exporter:9100，milvus 连 etcd:2379、minio:9000）
+networks:
+  default:
+    name: oncall-net
+    driver: bridge
+
+# 命名卷：由 Docker 统一管理（存放位置不在项目目录里，用 docker volume inspect 查看）
+# 注意：Milvus 全家桶用的是绑定挂载 ./volumes/...，不在这里
+volumes:
+  redis-data:
+  prometheus-data:
+  alertmanager-data:

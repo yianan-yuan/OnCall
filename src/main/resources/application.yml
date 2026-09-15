@@ -1,0 +1,141 @@
+server:
+  port: 9900
+  servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
+
+file:
+  upload:
+    path: ./uploads
+    allowed-extensions: txt,md
+
+milvus:
+  host: localhost
+  port: 19530
+  username: ""
+  password: ""
+  database: default
+  timeout: 10000
+
+# Spring AI Alibaba DashScope 配置
+spring:
+  # 密钥等私有配置放 application-local.yml（已在 .gitignore 里，不会被提交）
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:local}
+  ai:
+    dashscope:
+      api-key: ${DASHSCOPE_API_KEY:}  # 本机真实值放 application-local.yml（已 gitignore）或环境变量
+      chat:
+        options:
+          timeout: 180000  # 超时时间180秒（3分钟）
+      retry:
+        max-attempts: 3  # 最大重试次数
+        backoff:
+          initial-interval: 2000  # 初始重试间隔2秒
+          multiplier: 2  # 重试间隔倍数
+          max-interval: 10000  # 最大重试间隔10秒
+
+    # Spring AI MCP 客户端配置（腾讯云日志 MCP 服务）
+    mcp:
+      client:
+        enabled: true
+        name: tencent-mcp-server
+        version: 1.0.0
+        request-timeout: 60s
+        type: ASYNC
+        sse:
+          connections:
+            tencent-cls:
+              url: http://localhost:3000
+              sse-endpoint: /sse  # 完整的SSE端点路径
+
+  # Redis 配置（对话上下文记忆的存储，Redis 不可用时自动降级为内存）
+  data:
+    redis:
+      host: 127.0.0.1  # 用 IP 而非 localhost，避免 Windows 下解析为 IPv6 连不上
+      port: 6379
+      database: 0
+      timeout: 3000ms  # 命令超时
+      connect-timeout: 3000ms
+
+# 阿里云 DashScope 配置
+# 注意：DeepSeek 没有 embedding / rerank 接口，所以向量化与精排仍走阿里云
+dashscope:
+  api:
+    key: ${DASHSCOPE_API_KEY:}  # 同上，供自定义 Embedding 客户端使用
+  embedding:
+    model: qwen3.7-text-embedding-flash  # 阿里云文本向量化模型（1024维）
+
+# DeepSeek 对话模型配置（OpenAI 兼容协议，上下文 1M、最大输出 384K、支持工具调用）
+deepseek:
+  api-key: ${DEEPSEEK_API_KEY:}  # 本机真实值放 application-local.yml（已 gitignore）或环境变量
+  base-url: https://api.deepseek.com
+
+# 文档分片配置
+document:
+  chunk:
+    max-size: 800  # 每个分片最大字符数
+    overlap: 100   # 分片之间的重叠字符数
+
+# RAG 配置（仅旧版 RagService 使用，实际检索走 retrieval.*）
+rag:
+  top-k: 3  # 检索返回的最相似文档数量
+  model: "qwen3.7-max"  # 大语言模型名称
+
+# Prometheus 配置
+prometheus:
+  base-url: http://127.0.0.1:9090  # 用 IP 而非 localhost，避免 Windows 下解析为 IPv6 连不上
+  timeout: 10  # 超时时间（秒）
+  mock-enabled: true  # 是否启用 Mock 模式（用于测试）
+
+# CLS 云日志服务配置
+cls:
+  mock-enabled: true  # 是否启用 Mock 模式（用于测试，设为 true 返回与告警关联的模拟日志数据）
+
+# ==================== 混合检索配置 ====================
+# 检索流水线：向量召回 + BM25 关键词召回（并行）→ RRF 融合 → 精排
+retrieval:
+  top-k: 5                       # 最终返回条数
+  max-top-k: 5                   # 硬上限，超过会被截断
+  vector-candidate-limit: 20     # 向量通道召回候选数
+  bm25-candidate-limit: 20       # 关键词通道召回候选数
+  rerank-candidate-limit: 20     # 融合后进入精排的候选数
+  rrf-k: 60                      # RRF 平滑参数 k
+  rerank-enabled: true           # 是否启用精排
+  rerank-model: qwen3.7-text-rerank  # 精排模型名称
+  rerank-url: https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+  rerank-timeout-seconds: 30     # 精排请求超时（秒）
+  rerank-max-retries: 2          # 精排失败重试次数
+  chunk-enumeration-batch-size: 500    # 分片枚举批次大小
+  chunk-enumeration-limit: 10000       # 分片枚举最大条数
+
+# ==================== 对话与上下文记忆配置 ====================
+chat:
+  model: deepseek-flash          # 指定用 Flash；另一个可选 deepseek-v4-pro（贵约 4 倍）
+  use-mcp-tools: false           # 是否把 MCP 工具交给 Agent（false 时只用本地工具）
+
+  # 分层记忆机制：滑动窗口保留最近几轮原文 + 更早对话压缩为摘要
+  memory:
+    enabled: true
+    store: redis                 # redis = 存 Redis（重启不丢）；memory = 存内存
+    window-turns: 5              # 滑动窗口保留的最近轮数
+    compact-batch-turns: 5       # 未压缩对话超过"窗口轮数 + 该值"时压缩一次
+    context-window-tokens: 1000000 # 上下文窗口 token 预算（与 agent_py 的 contextWindowTokens 保持一致）
+    auto-compact-percent: 70     # 占用达到该百分比时触发压缩
+    hard-limit-percent: 95       # 占用达到该百分比时拒绝本轮请求
+    mode: context_70_percent     # 压缩模式：every_30_turns | context_70_percent | manual
+    every-n-turns: 30            # every_30_turns 模式下每多少轮压缩一次
+    summary-max-chars: 1200      # 摘要最大字数
+    redis-key-prefix: "chat:session:"  # Redis 键前缀
+    redis-ttl-days: 7            # 会话在 Redis 中的过期时间（天）
+
+# ==================== 告警自动诊断配置 ====================
+# Alertmanager 通过 Webhook 把告警推送到本服务，自动触发 AIOps 排查
+alert:
+  webhook:
+    enabled: true
+    max-concurrent-diagnoses: 2  # 同时执行的最大诊断数
+    dedup-ttl-minutes: 30        # 同一告警指纹的去重窗口（分钟）
+    max-recent-runs: 50          # 内存中保留的最近诊断记录数

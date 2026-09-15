@@ -1,0 +1,47 @@
+# =============================================================================
+# Alertmanager 配置
+# 挂载位置：./docker/alertmanager/alertmanager.yml -> /etc/alertmanager/alertmanager.yml
+# 作用：接收 Prometheus 推过来的告警，做去重/分组/抑制后发通知。
+#       默认只把告警发给飞书群；需要"告警自动诊断"时，在下面 route.routes 里放开应用那条路由。
+# 语法自检：docker run --rm --entrypoint amtool -v "${PWD}/docker/alertmanager/alertmanager.yml:/tmp/am.yml:ro" prom/alertmanager:v0.28.1 check-config /tmp/am.yml
+# =============================================================================
+
+# 全局参数
+global:
+  # 告警恢复（resolved）通知的最长等待时间
+  resolve_timeout: 5m
+
+# 路由规则：决定"哪条告警、隔多久、发给谁"
+route:
+  # 同一个 alertname + 同一个 service 的告警合并成一条通知，避免刷屏
+  group_by: [alertname, service]
+  group_wait: 10s       # 首次分组等待时间，把同一批告警攒在一起再发
+  group_interval: 1m    # 同一分组内新增告警的发送间隔
+  repeat_interval: 1h   # 同一分组重复提醒间隔（告警未恢复也不会疯狂刷屏）
+  # 当前只发飞书群通知
+  receiver: feishu-webhook
+
+  # 想让告警同时触发 AI 自动诊断时，把下面这段放开（放开后每条告警都会跑一轮多 Agent 排查）
+  # routes:
+  #   - receiver: oncall-agent-webhook
+  #     matchers:
+  #       - alertname=~".+"
+  #     continue: true      # 继续匹配兄弟路由，于是飞书那条也照常收到
+
+# 接收器（通知渠道）
+receivers:
+  - name: feishu-webhook
+    webhook_configs:
+      # 指向飞书适配器（compose 服务名），由它转成飞书消息格式再转发给群机器人
+      - url: http://feishu-adapter:8080/webhook
+        send_resolved: true
+
+  # 应用侧接收器：默认不接线，需要"告警自动诊断"时在 route.routes 里放开即可
+  - name: oncall-agent-webhook
+    webhook_configs:
+      # URL 指向宿主机上的 Spring Boot 应用（server.port: 9900）的 AIOps 自动诊断入口。
+      # 应用不在容器里，容器内需用 host.docker.internal 访问宿主机：
+      # Linux 原生 Docker 需要在 docker-compose.yml 里加
+      # extra_hosts: ["host.docker.internal:host-gateway"]（本项目已加）。
+      - url: http://host.docker.internal:9900/api/alertmanager/webhook
+        send_resolved: true

@@ -1,0 +1,20 @@
+# =============================================================================
+# 本地私有配置模板
+# 用法：复制成同目录下的 application-local.yml，填上自己的 Key 即可
+#      （application-local.yml 已被 .gitignore 忽略，不会提交到 Git）
+# =============================================================================
+
+spring:
+  ai:
+    dashscope:
+      # 阿里云百炼（DashScope）API Key：用于文本向量化（embedding）与精排（rerank）
+      api-key: 你的阿里云百炼APIKey
+
+dashscope:
+  api:
+    # 自定义 Embedding 客户端读的是这个 key，与上面填同一个即可
+    key: 你的阿里云百炼APIKey
+
+deepseek:
+  # DeepSeek 官方 API Key：对话、AIOps 编排、记忆摘要都走它
+  api-key: 你的DeepSeekAPIKey

@@ -1,0 +1,41 @@
+# =============================================================================
+# Prometheus 主配置
+# 挂载位置：./docker/prometheus/prometheus.yml -> /etc/prometheus/prometheus.yml
+# 作用：配置抓取频率、告警规则文件位置、抓取目标
+# =============================================================================
+
+# 全局配置：所有 job 的默认值
+global:
+  scrape_interval: 15s      # 抓取间隔
+  evaluation_interval: 15s  # 规则计算间隔
+
+# 告警规则文件：5 条规则见 rules.yml，与 aiops-docs/ 的 5 份手册对应
+rule_files:
+  - /etc/prometheus/rules.yml
+
+# 告警转发：规则触发后把告警推给 Alertmanager（不配这段 Alertmanager 收不到）
+alerting:
+  alertmanagers:
+    - static_configs:
+        # alertmanager 是 compose 服务名
+        - targets: ["alertmanager:9093"]
+
+# 抓取目标：Prometheus 主动去这些地址拉指标
+scrape_configs:
+  # 1) Prometheus 自身（抓取耗时、规则计算耗时、目标存活）
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # 2) node-exporter：CPU / 内存 / 磁盘 / 网络等系统指标，告警规则都基于这个 job
+  #    job 名固定为 node，规则里的 up{job="node"} 靠这个名字匹配
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # 3) 应用自身指标（预留，未启用）：需先引入 actuator + micrometer-registry-prometheus，
+  #    否则 /actuator/prometheus 不存在，打开后该 job 会一直是 down
+  # - job_name: oncall-agent-app
+  #   metrics_path: /actuator/prometheus
+  #   static_configs:
+  #     - targets: ["host.docker.internal:9900"]

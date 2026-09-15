@@ -1,0 +1,88 @@
+# =============================================================================
+# Prometheus 告警规则（5 条）
+# 挂载位置：./docker/prometheus/rules.yml -> /etc/prometheus/rules.yml
+#
+# 5 条规则的告警名与项目 aiops-docs/ 下的 5 份运维手册一一对应，AI Agent 按
+# alertname 检索对应手册生成诊断结论，因此告警名不要随意改名：
+#   HighCPUUsage       <-> aiops-docs/cpu_high_usage.md
+#   HighMemoryUsage    <-> aiops-docs/memory_high_usage.md
+#   HighDiskUsage      <-> aiops-docs/disk_high_usage.md
+#   ServiceUnavailable <-> aiops-docs/service_unavailable.md
+#   SlowResponse       <-> aiops-docs/slow_response.md
+#
+# 语法自检：docker run --rm --entrypoint promtool -v "${PWD}/docker/prometheus/rules.yml:/rules.yml:ro" prom/prometheus:v2.54.1 check rules /rules.yml
+# =============================================================================
+
+groups:
+  # ---------------------------------------------------------------------------
+  # 第一组：系统资源类告警，全部基于 node-exporter 上报的指标
+  # ---------------------------------------------------------------------------
+  - name: oncall-system-resource
+    rules:
+      # 规则 1：CPU 使用率过高（> 80% 持续 1 分钟）
+      # 100 减去 5 分钟平均空闲占比即使用率，按实例聚合避免多核被拆成多条曲线
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 1m
+        labels:
+          severity: critical          # 严重：与手册里的「严重」级别一致
+          service: system             # 归属：系统层面（非某个业务微服务）
+        annotations:
+          summary: "CPU 使用率过高（实例 {{ $labels.instance }} 当前 {{ printf \"%.1f\" $value }}%）"
+          description: "实例 {{ $labels.instance }} 的 CPU 使用率已连续 1 分钟超过 80%，当前值 {{ printf \"%.1f\" $value }}%。可能导致应用响应变慢、请求超时甚至雪崩。请按 aiops-docs/cpu_high_usage.md 排查：先看 top 找高消耗进程，再查是否有死循环、流量突增、定时任务重叠执行或慢 SQL。"
+
+      # 规则 2：内存使用率过高（> 85% 持续 1 分钟）
+      # 用 MemAvailable 而非 MemFree，前者已扣除可回收缓存，更接近真实可用内存
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 1m
+        labels:
+          severity: critical          # 严重：与手册里的「严重」级别一致
+          service: system
+        annotations:
+          summary: "内存使用率过高（实例 {{ $labels.instance }} 当前 {{ printf \"%.1f\" $value }}%）"
+          description: "实例 {{ $labels.instance }} 的内存使用率已连续 1 分钟超过 85%，当前值 {{ printf \"%.1f\" $value }}%。可能触发频繁 Full GC 甚至 OOM 导致应用崩溃。请按 aiops-docs/memory_high_usage.md 排查：查看 JVM 堆使用与 GC 日志，检查是否有内存泄漏、缓存配置不当或大文件处理。"
+
+      # 规则 3：磁盘使用率过高（> 85% 持续 1 分钟）
+      # 只算根分区，并排除 tmpfs/ramfs/squashfs 等内存文件系统（不是真磁盘，会误报）
+      - alert: HighDiskUsage
+        expr: (1 - (node_filesystem_avail_bytes{mountpoint="/", fstype!~"tmpfs|ramfs|squashfs"} / node_filesystem_size_bytes{mountpoint="/", fstype!~"tmpfs|ramfs|squashfs"})) * 100 > 85
+        for: 1m
+        labels:
+          severity: warning           # 警告：与手册「>80% 警告 / >90% 严重」的分级对应
+          service: system
+        annotations:
+          summary: "磁盘使用率过高（挂载点 {{ $labels.mountpoint }} 当前 {{ printf \"%.1f\" $value }}%）"
+          description: "实例 {{ $labels.instance }} 的根分区 {{ $labels.mountpoint }} 使用率已连续 1 分钟超过 85%，当前值 {{ printf \"%.1f\" $value }}%。磁盘写满会导致日志无法落盘、数据库损坏、应用崩溃。请按 aiops-docs/disk_high_usage.md 排查：检查日志文件、临时文件、备份文件、Docker 镜像与容器占用，必要时清理或扩容。"
+
+  # ---------------------------------------------------------------------------
+  # 第二组：服务可用性与性能类告警
+  # ---------------------------------------------------------------------------
+  - name: oncall-service-availability
+    rules:
+      # 规则 4：服务不可用（目标失联 1 分钟）
+      # up 是 Prometheus 自带的"能否抓到目标"指标，1=正常，0=抓不到
+      - alert: ServiceUnavailable
+        expr: up{job="node"} == 0
+        for: 1m
+        labels:
+          severity: critical          # 紧急：与手册里的「紧急」级别一致
+          service: node-exporter      # 被监控对象：node-exporter 采集目标
+        annotations:
+          summary: "服务不可用（目标 {{ $labels.instance }} 已失联）"
+          description: "Prometheus 已连续 1 分钟无法抓取目标 {{ $labels.instance }}（job={{ $labels.job }}），说明该服务进程已退出、端口不通或网络故障。请按 aiops-docs/service_unavailable.md 排查：先确认进程与端口是否存活，再检查依赖服务（数据库/Redis/MQ）、配置错误与资源耗尽。"
+
+      # 规则 5：响应时间过长 —— 演示用占位规则，正常情况下永远不会触发
+      # node-exporter 没有 HTTP 响应时间指标，这里用一个不可能达到的阈值（网络吞吐 > 1TB/s）
+      # 占位，保证规则语法有效且不误报。真实场景应改用 blackbox_exporter 的
+      # probe_duration_seconds，或应用侧 histogram_quantile(0.99, ...http_server_requests_seconds_bucket)。
+      # 演示时用 docker/publish-demo-alerts.ps1 手工推送该告警即可。
+      - alert: SlowResponse
+        expr: avg by(instance) (rate(node_network_receive_bytes_total{job="node"}[5m])) > 1e12
+        for: 1m
+        labels:
+          severity: warning           # 警告：与手册里的「警告」级别一致
+          service: business-service   # 真实场景应填具体微服务名（如 order-service）
+        annotations:
+          summary: "服务响应时间过长（占位规则，实例 {{ $labels.instance }}）"
+          description: "占位规则：node-exporter 没有响应时间指标，本规则用「网络吞吐 > 1TB/s」这种不可能达到的阈值代替，正常情况下不会触发，仅用于演示告警链路。真实场景请参考 aiops-docs/slow_response.md，用 blackbox_exporter 的 probe_duration_seconds 或应用侧 http_server_requests_seconds 的 P99 指标判断；演示时请用 docker/publish-demo-alerts.ps1 手工推送 SlowResponse 告警。"
